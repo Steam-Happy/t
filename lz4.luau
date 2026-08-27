@@ -1,287 +1,235 @@
+--!optimize 2
+--!native
 --!strict
--- metatablecat 2022
 
-local lz4 = {}
+local P1, P2, P3, P4 = 85, 7225, 614125, 52200625
 
-type Streamer = {
-	Offset: number,
-	Source: string,
-	Length: number,
-	IsFinished: boolean,
-	LastUnreadBytes: number,
+local ENC_LUT_HI = buffer.create(14000) 
+local ENC_LUT_LO = buffer.create(30000)
 
-	read: (Streamer, len: number?, shiftOffset: boolean?) -> string,
-	seek: (Streamer, len: number) -> (),
-	append: (Streamer, newData: string) -> (),
-	toEnd: (Streamer) -> ()
+local DECODE_A = buffer.create(262144)
+local DECODE_B = buffer.create(262144)
+
+for i = 0, 6995 do
+	buffer.writeu16(ENC_LUT_HI, i * 2, (i // 85 + 33) + (i % 85 + 33) * 256)
+end
+
+for i = 0, 7224 do
+	buffer.writeu32(ENC_LUT_LO, i * 4, ((i // 85 + 33) + (i % 85 + 33) * 256) * 65536)
+end
+
+for c1 = 0, 255 do
+	local v1 = c1 - 33
+	if v1 < 0 or v1 > 84 then continue end
+
+	for c2 = 0, 255 do
+		local v2 = c2 - 33
+		if v2 < 0 or v2 > 84 then continue end
+
+		local key = (c1 + c2 * 256) * 4
+
+		buffer.writeu32(DECODE_A, key, v1 * P4 + v2 * P3 - 33)
+		buffer.writeu32(DECODE_B, key, v1 * P2 + v2 * P1)
+	end
+end
+
+local function Encode(Input: buffer): buffer
+	local Len = buffer.len(Input)
+	if Len == 0 then return buffer.create(0) end
+
+	local Rem = Len % 4
+	local Output = buffer.create(Len // 4 * 5 + (if Rem > 0 then Rem + 1 else 0))
+
+	local OutIdx = 0
+	local UnrollLimit = Len - 16
+
+	local LutHi = ENC_LUT_HI
+	local LutLo = ENC_LUT_LO
+
+	for i = 0, UnrollLimit, 16 do
+		local W1 = bit32.byteswap(buffer.readu32(Input, i))
+		local W2 = bit32.byteswap(buffer.readu32(Input, i + 4))
+		local W3 = bit32.byteswap(buffer.readu32(Input, i + 8))
+		local W4 = bit32.byteswap(buffer.readu32(Input, i + 12))
+
+		local P1_1 = W1 // 614125
+		local R1_1 = W1 - P1_1 * 614125
+		local P1_2 = W2 // 614125
+		local R1_2 = W2 - P1_2 * 614125
+		local P1_3 = W3 // 614125
+		local R1_3 = W3 - P1_3 * 614125
+		local P1_4 = W4 // 614125
+		local R1_4 = W4 - P1_4 * 614125
+
+		local P2_1 = R1_1 // 85
+		local P2_2 = R1_2 // 85
+		local P2_3 = R1_3 // 85
+		local P2_4 = R1_4 // 85
+
+		local ValHi1 = buffer.readu16(LutHi, P1_1 * 2)
+		local ValLo1 = buffer.readu32(LutLo, P2_1 * 4)
+		buffer.writeu32(Output, OutIdx, ValHi1 + ValLo1)
+		buffer.writeu8(Output, OutIdx + 4, (R1_1 - P2_1 * 85) + 33)
+
+		local ValHi2 = buffer.readu16(LutHi, P1_2 * 2)
+		local ValLo2 = buffer.readu32(LutLo, P2_2 * 4)
+		buffer.writeu32(Output, OutIdx + 5, ValHi2 + ValLo2)
+		buffer.writeu8(Output, OutIdx + 9, (R1_2 - P2_2 * 85) + 33)
+
+		local ValHi3 = buffer.readu16(LutHi, P1_3 * 2)
+		local ValLo3 = buffer.readu32(LutLo, P2_3 * 4)
+		buffer.writeu32(Output, OutIdx + 10, ValHi3 + ValLo3)
+		buffer.writeu8(Output, OutIdx + 14, (R1_3 - P2_3 * 85) + 33)
+
+		local ValHi4 = buffer.readu16(LutHi, P1_4 * 2)
+		local ValLo4 = buffer.readu32(LutLo, P2_4 * 4)
+		buffer.writeu32(Output, OutIdx + 15, ValHi4 + ValLo4)
+		buffer.writeu8(Output, OutIdx + 19, (R1_4 - P2_4 * 85) + 33)
+
+		OutIdx += 20
+	end
+
+	local InIdx = (OutIdx // 5) * 4
+	while InIdx <= Len - 4 do
+		local W = bit32.byteswap(buffer.readu32(Input, InIdx))
+		local P1 = W // 614125
+		local R1 = W - P1 * 614125
+		local P2 = R1 // 85
+
+		buffer.writeu32(Output, OutIdx, buffer.readu16(LutHi, P1 * 2) + buffer.readu32(LutLo, P2 * 4))
+		buffer.writeu8(Output, OutIdx + 4, (R1 - P2 * 85) + 33)
+
+		InIdx += 4
+		OutIdx += 5
+	end
+
+	if Rem > 0 then
+		local Val = 0
+		for i = 0, Rem - 1 do
+			Val = Val * 256 + buffer.readu8(Input, InIdx + i)
+		end
+
+		if Rem == 1 then
+			Val *= 16777216 
+		elseif Rem == 2 then
+			Val *= 65536
+		elseif Rem == 3 then
+			Val *= 256
+		end
+
+		local P1 = Val // 614125
+		local R1 = Val - P1 * 614125
+		local P2 = R1 // 85
+
+		local Part2 = buffer.readu32(LutLo, P2 * 4)
+		buffer.writeu16(Output, OutIdx, buffer.readu16(LutHi, P1 * 2))
+		if Rem > 1 then
+			buffer.writeu8(Output, OutIdx + 2, (Part2 // 65536) % 256)
+			if Rem > 2 then
+				buffer.writeu8(Output, OutIdx + 3, Part2 // 16777216)
+			end
+		end
+	end
+
+	return Output
+end
+
+local function Decode(Input: buffer): buffer
+	local Len = buffer.len(Input)
+	if Len == 0 then return buffer.create(0) end
+
+	local Rem = Len % 5
+	local Output = buffer.create((Len // 5) * 4 + (if Rem > 0 then Rem - 1 else 0))
+
+	local OutIdx = 0
+	local UnrollLimit = Len - 20
+
+	local DecA, DecB = DECODE_A, DECODE_B
+
+	for i = 0, UnrollLimit, 20 do
+		buffer.writeu32(Output, OutIdx, bit32.byteswap(
+			buffer.readu32(DecA, buffer.readu16(Input, i) * 4)
+				+ buffer.readu32(DecB, buffer.readu16(Input, i + 2) * 4)
+				+ buffer.readu8(Input, i + 4))
+		)
+
+		buffer.writeu32(Output, OutIdx + 4, bit32.byteswap(
+			buffer.readu32(DecA, buffer.readu16(Input, i + 5) * 4)
+				+ buffer.readu32(DecB, buffer.readu16(Input, i + 7) * 4)
+				+ buffer.readu8(Input, i + 9))
+		)
+
+		buffer.writeu32(Output, OutIdx + 8, bit32.byteswap(
+			buffer.readu32(DecA, buffer.readu16(Input, i + 10) * 4)
+				+ buffer.readu32(DecB, buffer.readu16(Input, i + 12) * 4)
+				+ buffer.readu8(Input, i + 14))
+		)
+
+		buffer.writeu32(Output, OutIdx + 12, bit32.byteswap(
+			buffer.readu32(DecA, buffer.readu16(Input, i + 15) * 4) 
+				+ buffer.readu32(DecB, buffer.readu16(Input, i + 17) * 4) 
+				+ buffer.readu8(Input, i + 19))
+		)
+
+		OutIdx += 16
+	end
+
+	local InIdx = (OutIdx // 4) * 5
+	while InIdx <= Len - 5 do
+		buffer.writeu32(Output, OutIdx, bit32.byteswap(
+			buffer.readu32(DecA, buffer.readu16(Input, InIdx) * 4) 
+				+ buffer.readu32(DecB, buffer.readu16(Input, InIdx + 2) * 4)
+				+ buffer.readu8(Input, InIdx + 4))
+		)
+
+		InIdx += 5
+		OutIdx += 4
+	end
+
+	if InIdx < Len then
+		local CharsLeft = Len - InIdx
+		local Sum = 0
+
+		for i = 0, CharsLeft - 1 do
+			local char = buffer.readu8(Input, InIdx + i)
+			local val = char - 33
+
+			if i == 0 then
+				Sum += val * P4
+			elseif i == 1 then
+				Sum += val * P3
+			elseif i == 2 then
+				Sum += val * P2
+			elseif i == 3 then
+				Sum += val * P1
+			end
+		end
+
+		for i = CharsLeft, 4 do
+			if i == 1 then
+				Sum += 84 * P3
+			elseif i == 2 then
+				Sum += 84 * P2
+			elseif i == 3 then
+				Sum += 84 * P1
+			elseif i == 4 then
+				Sum += 84
+			end
+		end
+
+		buffer.writeu8(Output, OutIdx, bit32.extract(Sum, 24, 8))
+		if CharsLeft > 2 then
+			buffer.writeu8(Output, OutIdx + 1, bit32.extract(Sum, 16, 8))
+			if CharsLeft > 3 then
+				buffer.writeu8(Output, OutIdx + 2, bit32.extract(Sum, 8, 8))
+			end
+		end
+	end
+
+	return Output
+end
+
+return {
+	Encode = Encode,
+	Decode = Decode
 }
-
-type BlockData = {
-	[number]: {
-		Literal: string,
-		LiteralLength: number,
-		MatchOffset: number?,
-		MatchLength: number?
-	}
-}
-
-local function plainFind(str, pat)
-	return string.find(str, pat, 0, true)
-end
-
-local function streamer(str): Streamer
-	local Stream = {}
-	Stream.Offset = 0
-	Stream.Source = str
-	Stream.Length = string.len(str)
-	Stream.IsFinished = false	
-	Stream.LastUnreadBytes = 0
-
-	function Stream.read(self: Streamer, len: number?, shift: boolean?): string
-		local len = len or 1
-		local shift = if shift ~= nil then shift else true
-		local dat = string.sub(self.Source, self.Offset + 1, self.Offset + len)
-
-		local dataLength = string.len(dat)
-		local unreadBytes = len - dataLength
-
-		if shift then
-			self:seek(len)
-		end
-
-		self.LastUnreadBytes = unreadBytes
-		return dat
-	end
-
-	function Stream.seek(self: Streamer, len: number)
-		local len = len or 1
-
-		self.Offset = math.clamp(self.Offset + len, 0, self.Length)
-		self.IsFinished = self.Offset >= self.Length
-	end
-
-	function Stream.append(self: Streamer, newData: string)
-		-- adds new data to the end of a stream
-		self.Source ..= newData
-		self.Length = string.len(self.Source)
-		self:seek(0) --hacky but forces a recalculation of the isFinished flag
-	end
-
-	function Stream.toEnd(self: Streamer)
-		self:seek(self.Length)
-	end
-
-	return Stream
-end
-
-function lz4.compress(str: string): string
-	local blocks: BlockData = {}
-	local iostream = streamer(str)
-
-	if iostream.Length > 12 then
-		local firstFour = iostream:read(4)
-
-		local processed = firstFour
-		local lit = firstFour
-		local match = ""
-		local LiteralPushValue = ""
-		local pushToLiteral = true
-
-		repeat
-			pushToLiteral = true
-			local nextByte = iostream:read()
-
-			if plainFind(processed, nextByte) then
-				local next3 = iostream:read(3, false)
-
-				if string.len(next3) < 3 then
-					--push bytes to literal block then break
-					LiteralPushValue = nextByte .. next3
-					iostream:seek(3)
-				else
-					match = nextByte .. next3
-
-					local matchPos = plainFind(processed, match)
-					if matchPos then
-						iostream:seek(3)
-						repeat
-							local nextMatchByte = iostream:read(1, false)
-							local newResult = match .. nextMatchByte
-
-							local repos = plainFind(processed, newResult) 
-							if repos then
-								match = newResult
-								matchPos = repos
-								iostream:seek(1)
-							end
-						until not plainFind(processed, newResult) or iostream.IsFinished
-
-						local matchLen = string.len(match)
-						local pushMatch = true
-
-						if iostream.Length - iostream.Offset <= 5 then
-							LiteralPushValue = match
-							pushMatch = false
-							--better safe here, dont bother pushing to match ever
-						end
-
-						if pushMatch then
-							pushToLiteral = false
-
-							-- gets the position from the end of processed, then slaps it onto processed
-							local realPosition = string.len(processed) - matchPos
-							processed = processed .. match
-
-							table.insert(blocks, {
-								Literal = lit,
-								LiteralLength = string.len(lit),
-								MatchOffset = realPosition + 1,
-								MatchLength = matchLen,
-							})
-							lit = ""
-						end
-					else
-						LiteralPushValue = nextByte
-					end
-				end
-			else
-				LiteralPushValue = nextByte
-			end
-
-			if pushToLiteral then
-				lit = lit .. LiteralPushValue
-				processed = processed .. nextByte
-			end
-		until iostream.IsFinished
-		table.insert(blocks, {
-			Literal = lit,
-			LiteralLength = string.len(lit)
-		})
-	else
-		local str = iostream.Source
-		blocks[1] = {
-			Literal = str,
-			LiteralLength = string.len(str)
-		}
-	end
-
-	-- generate the output chunk
-	-- %s is for adding header
-	local output = string.rep("\x00", 4)
-	local function write(char)
-		output = output .. char
-	end
-	-- begin working through chunks
-	for chunkNum, chunk in blocks do
-		local litLen = chunk.LiteralLength
-		local matLen = (chunk.MatchLength or 4) - 4
-
-		-- create token
-		local tokenLit = math.clamp(litLen, 0, 15)
-		local tokenMat = math.clamp(matLen, 0, 15)
-
-		local token = bit32.lshift(tokenLit, 4) + tokenMat
-		write(string.pack("<I1", token))
-
-		if litLen >= 15 then
-			litLen = litLen - 15
-			--begin packing extra bytes
-			repeat
-				local nextToken = math.clamp(litLen, 0, 0xFF)
-				write(string.pack("<I1", nextToken))
-				if nextToken == 0xFF then
-					litLen = litLen - 255
-				end
-			until nextToken < 0xFF
-		end
-
-		-- push raw lit data
-		write(chunk.Literal)
-
-		if chunkNum ~= #blocks then
-			-- push offset as u16
-			write(string.pack("<I2", chunk.MatchOffset))
-
-			-- pack extra match bytes
-			if matLen >= 15 then
-				matLen = matLen - 15
-
-				repeat
-					local nextToken = math.clamp(matLen, 0, 0xFF)
-					write(string.pack("<I1", nextToken))
-					if nextToken == 0xFF then
-						matLen = matLen - 255
-					end
-				until nextToken < 0xFF
-			end
-		end
-	end
-	--append chunks
-	local compLen = string.len(output) - 4
-	local decompLen = iostream.Length
-
-	return string.pack("<I4", compLen) .. string.pack("<I4", decompLen) .. output
-end
-
-function lz4.decompress(lz4data: string): string
-	local inputStream = streamer(lz4data)
-
-	local compressedLen = string.unpack("<I4", inputStream:read(4))
-	local decompressedLen = string.unpack("<I4", inputStream:read(4))
-	local reserved = string.unpack("<I4", inputStream:read(4))
-
-	if compressedLen == 0 then
-		return inputStream:read(decompressedLen)
-	end
-
-	local outputStream = streamer("")
-
-	repeat
-		local token = string.byte(inputStream:read())
-		local litLen = bit32.rshift(token, 4)
-		local matLen = bit32.band(token, 15) + 4
-
-		if litLen >= 15 then
-			repeat
-				local nextByte = string.byte(inputStream:read())
-				litLen += nextByte
-			until nextByte ~= 0xFF
-		end
-
-		local literal = inputStream:read(litLen)
-		outputStream:append(literal)
-		outputStream:toEnd()
-		if outputStream.Length < decompressedLen then
-			--match
-			local offset = string.unpack("<I2", inputStream:read(2))
-			if matLen >= 19 then
-				repeat
-					local nextByte = string.byte(inputStream:read())
-					matLen += nextByte
-				until nextByte ~= 0xFF
-			end
-
-			outputStream:seek(-offset)
-			local pos = outputStream.Offset
-			local match = outputStream:read(matLen)
-			local unreadBytes = outputStream.LastUnreadBytes
-			local extra
-			if unreadBytes then
-				repeat
-					outputStream.Offset = pos
-					extra = outputStream:read(unreadBytes)
-					unreadBytes = outputStream.LastUnreadBytes
-					match ..= extra
-				until unreadBytes <= 0
-			end
-
-			outputStream:append(match)
-			outputStream:toEnd()
-		end
-
-	until outputStream.Length >= decompressedLen
-
-	return outputStream.Source
-end
-
-return lz4
