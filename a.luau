@@ -1,1 +1,1 @@
-print("Tung tung tung sahur.")
+--print("Tung tung tung sahur.")
